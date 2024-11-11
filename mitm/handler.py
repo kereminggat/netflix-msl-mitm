@@ -23,7 +23,8 @@ class Handler:
     ]
 
     def __init__(self) -> None:
-        self.server_key: Optional[bytes] = None
+        self.encryption_key: Optional[bytes] = None
+        self.sign_key: Optional[bytes] = None
 
         self.__proxy_sign_key = RSA.generate(2048, lambda x: bytes(random.getrandbits(8) for _ in range(x)))
         self.__proxy_rsa_key: Optional[RSA.RsaKey] = None
@@ -43,23 +44,26 @@ class Handler:
 
         if keys_path.exists():
             data = json.loads(keys_path.read_bytes())
-            self.server_key = base64.b64decode(data['server_key'])
+            
+            self.encryption_key = base64.b64decode(data['encryption_key'])
+            self.sign_key = base64.b64decode(data['sign_key'])
 
             print('[+] Loaded keys!')
         else:
-            print('[!] Decryption keys not found! Waiting for keys exchange ...')
+            print('[!] Exchange keys not found! Waiting for keys exchange ...')
 
     def init_logs(self):
-        shutil.rmtree(Handler.LOGS_FOLDER, ignore_errors=True)
+        # shutil.rmtree(Handler.LOGS_FOLDER, ignore_errors=True)
         Handler.LOGS_FOLDER.mkdir(parents=True, exist_ok=True)
 
-        print('[+] Initialized session logs')
+        print('[+] Initialized logs')
 
     def save_keys(self) -> None:
         keys_path = Path(__file__).parent.parent / 'exchange_key.json'
 
         keys_path.write_text(json.dumps({
-            'server_key': base64.b64encode(self.server_key).decode('utf-8')
+            'encryption_key': base64.b64encode(self.encryption_key).decode('utf-8'),
+            'sign_key': base64.b64encode(self.sign_key).decode('utf-8')
         }))
 
     def is_ready(self):
@@ -72,7 +76,7 @@ class Handler:
         if any(x in flow.request.pretty_url for x in [
             'msl_v1/cadmium', 'msl/cadmium', 'msl/playapi/cadmium'
         ]):
-            # print('[+] Receive Netflix MSL request')
+            print('[+] Receive Netflix MSL request')
 
             chunks = json.loads(f'[{flow.request.content.decode("utf-8").replace("}{", "},{")}]')
             header = chunks[0]
@@ -86,7 +90,7 @@ class Handler:
                 print('[+] Receive key exchange request for Netflix')
 
                 if headerdata['keyrequestdata'][0]['scheme'] != 'ASYMMETRIC_WRAPPED' or headerdata['keyrequestdata'][0]['keydata']['mechanism'] != 'JWK_RSA':
-                    print(f'{headerdata["keyrequestdata"][0]["scheme"]} key exchange scheme/mechanism not supported!')
+                    print(f'[!] {headerdata["keyrequestdata"][0]["scheme"]} key exchange scheme/mechanism not supported!')
                     return
                 
                 self.__real_public_key = RSA.import_key(base64.b64decode(headerdata['keyrequestdata'][0]['keydata']['publickey']))
@@ -109,7 +113,7 @@ class Handler:
         if any(x in flow.request.pretty_url for x in [
             'msl_v1/cadmium', 'msl/cadmium', 'msl/playapi/cadmium'
         ]):
-            # print('[+] Receive Netflix MSL response')
+            print('[+] Receive Netflix MSL response')
 
             chunks = json.loads(f'[{flow.response.content.decode("utf-8").replace("}{", "},{")}]')
             header = chunks[0]
@@ -131,8 +135,11 @@ class Handler:
                 hmac_data = decryptor.decrypt(base64.b64decode(headerdata['keyresponsedata']['keydata']['hmackey']))
                 encryption_data = decryptor.decrypt(base64.b64decode(headerdata['keyresponsedata']['keydata']['encryptionkey']))
 
-                print('[+] Save MSL decryption key')
-                self.server_key = Handler._b64_unpaded_decode(json.loads(encryption_data)['k'])
+                print('[+] Save MSL keys')
+                self.encryption_key = Handler._b64_unpaded_decode(json.loads(encryption_data)['k'])
+                self.sign_key = Handler._b64_unpaded_decode(json.loads(hmac_data)['k'])
+
+                self.save_request(flow)
                 
                 encryptor = PKCS1_OAEP.new(self.__real_public_key)
 
@@ -155,33 +162,11 @@ class Handler:
                 print('[+] Saving keys')
                 self.save_keys()
 
-            elif 'ciphertext' in headerdata:
-                if not self.server_key:
+            else:
+                if not self.encryption_key:
                     return
-                
-                # print('[+] New encrypted MSL request detected')
-                
-                req = self._parse_message(flow.request.content.decode('utf-8'))
-                res = self._parse_message(flow.response.content.decode('utf-8'))
-
-                request_id = ''.join([hex(zlib.crc32(x.encode('utf-8')))[2:] for x in [
-                    flow.request.pretty_url, str(flow.request.timestamp_start), str(flow.request.timestamp_end)
-                ]])
-
-                log_path = Handler.LOGS_FOLDER / f'{request_id}.jsonc'
-
-                with log_path.open('w+') as f:
-                    f.write(f'''// Request ID: {request_id}
-// URL: {flow.request.pretty_url}
-
-// Sended:
-{json.dumps(req, indent=4)}
-
-// Recived:
-{json.dumps(res, indent=4)}
-''')
-
-                print(f'[+] Saved decrypted MSL request to "{log_path.name}"')
+            
+                self.save_request(flow)        
 
         elif 'cadmium-playercore' in flow.request.pretty_url:
             print('[+] Update cadmium playercore file with our rsa proxy key')
@@ -198,8 +183,14 @@ class Handler:
         headerdata = json.loads(base64.b64decode(header['headerdata']))
 
         if 'ciphertext' in headerdata:
-            decryptor = AES.new(key=self.server_key, mode=AES.MODE_CBC, iv=base64.b64decode(headerdata['iv']))
+            decryptor = AES.new(key=self.encryption_key, mode=AES.MODE_CBC, iv=base64.b64decode(headerdata['iv']))
             headerdata = json.loads(Padding.unpad(decryptor.decrypt(base64.b64decode(headerdata['ciphertext'])), 16))
+
+        if 'keyresponsedata' in headerdata:
+            decryptor = PKCS1_OAEP.new(self.__proxy_rsa_key)
+
+            for key in ['hmackey', 'encryptionkey']:
+                headerdata['keyresponsedata']['keydata'][key] = json.loads(decryptor.decrypt(base64.b64decode(headerdata['keyresponsedata']['keydata'][key])))
 
         message = {}
 
@@ -211,7 +202,7 @@ class Handler:
                     payload_chunk['payload']
                 ).decode('utf-8'))
 
-                decryptor = AES.new(self.server_key, AES.MODE_CBC, iv=base64.b64decode(payload['iv']))
+                decryptor = AES.new(self.encryption_key, AES.MODE_CBC, iv=base64.b64decode(payload['iv']))
                 decrypted_content = json.loads(Padding.unpad(
                     decryptor.decrypt(base64.b64decode(payload['ciphertext'])), 16
                 ).decode('utf-8'))
@@ -235,6 +226,25 @@ class Handler:
             },
             'data': message
         }
+
+    def save_request(self, flow: HTTPFlow) -> None:
+        req = self._parse_message(flow.request.content.decode('utf-8'))
+        res = self._parse_message(flow.response.content.decode('utf-8'))
+
+        request_id = ''.join([hex(zlib.crc32(x.encode('utf-8')))[2:] for x in [
+            flow.request.pretty_url, str(flow.request.timestamp_start), str(flow.request.timestamp_end)
+        ]])
+
+        (Handler.LOGS_FOLDER / f'{request_id}.json').write_text(json.dumps({
+            'url': flow.request.pretty_url,
+            'requested_at': flow.request.timestamp_start,
+            'data': {
+                'request': req,
+                'response': res
+            }
+        }, indent=4))
+
+        print(f'[+] Saved MSL request "{request_id}"')
 
     @staticmethod
     def _b64_unpaded_decode(payload: str) -> bytes:
