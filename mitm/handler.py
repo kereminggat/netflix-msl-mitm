@@ -164,6 +164,7 @@ class Handler:
 
             else:
                 if not self.encryption_key:
+                    print('[-] No encryption key available, unable to decrypt data')
                     return
             
                 self.save_request(flow)        
@@ -183,8 +184,18 @@ class Handler:
         headerdata = json.loads(base64.b64decode(header['headerdata']))
 
         if 'ciphertext' in headerdata:
-            decryptor = AES.new(key=self.encryption_key, mode=AES.MODE_CBC, iv=base64.b64decode(headerdata['iv']))
-            headerdata = json.loads(Padding.unpad(decryptor.decrypt(base64.b64decode(headerdata['ciphertext'])), 16))
+            if not self.encryption_key:
+                print('[-] No encryption key, unable to decrypt data')
+                return
+
+            try:
+                decryptor = AES.new(key=self.encryption_key, mode=AES.MODE_CBC, iv=base64.b64decode(headerdata['iv']))
+                headerdata = json.loads(Padding.unpad(decryptor.decrypt(base64.b64decode(headerdata['ciphertext'])), 16))
+            except Exception:
+                print('[+] Encryption key seem to be invalid, MSL session probably changed ...')
+                self.encryption_key = None
+
+                return None
 
         if 'keyresponsedata' in headerdata:
             decryptor = PKCS1_OAEP.new(self.__proxy_rsa_key)
@@ -202,10 +213,16 @@ class Handler:
                     payload_chunk['payload']
                 ).decode('utf-8'))
 
-                decryptor = AES.new(self.encryption_key, AES.MODE_CBC, iv=base64.b64decode(payload['iv']))
-                decrypted_content = json.loads(Padding.unpad(
-                    decryptor.decrypt(base64.b64decode(payload['ciphertext'])), 16
-                ).decode('utf-8'))
+                try:
+                    decryptor = AES.new(self.encryption_key, AES.MODE_CBC, iv=base64.b64decode(payload['iv']))
+                    decrypted_content = json.loads(Padding.unpad(
+                        decryptor.decrypt(base64.b64decode(payload['ciphertext'])), 16
+                    ).decode('utf-8'))
+                except Exception:
+                    print('[+] Encryption key seem to be invalid, MSL session probably changed ...')
+                    self.encryption_key = None
+
+                    return None
 
                 content = base64.b64decode(decrypted_content['data'])
 
@@ -231,14 +248,21 @@ class Handler:
         req = self._parse_message(flow.request.content.decode('utf-8'))
         res = self._parse_message(flow.response.content.decode('utf-8'))
 
+        if not res or not req:
+            return
+
         request_id = ''.join([hex(zlib.crc32(x.encode('utf-8')))[2:] for x in [
             flow.request.pretty_url, str(flow.request.timestamp_start), str(flow.request.timestamp_end)
         ]])
 
-        (Handler.LOGS_FOLDER / f'{request_id}.json').write_text(json.dumps({
+        (Handler.LOGS_FOLDER / f'[{int(flow.request.timestamp_start * 1000)}] {request_id}.json').write_text(json.dumps({
             'url': flow.request.pretty_url,
             'requested_at': flow.request.timestamp_start,
-            'data': {
+            'raw': {
+                'request': json.loads(f'[{flow.request.content.decode("utf-8").replace("}{", "},{")}]'),
+                'response': json.loads(f'[{flow.response.content.decode("utf-8").replace("}{", "},{")}]')
+            },
+            'parsed': {
                 'request': req,
                 'response': res
             }
